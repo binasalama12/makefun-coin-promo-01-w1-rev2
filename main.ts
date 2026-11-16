@@ -1,162 +1,211 @@
-// Golden Buzzer ($BUZZER) — launch record verifier and promo writer.
-// Created for the makefun-coin-promo-01 bounty on make.fun.
-// Dependency-free: Node 22 standard library only.
-
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+#!/usr/bin/env node
+// Golden Buzzer ($BUZZER) — make.fun coin-promo entry bot.
+// Verifies the launch record, mirrors it, prints a stage-card,
+// emits promo drafts, and does a best-effort live lookup.
+import { readFileSync, mkdirSync, copyFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 const COIN_NAME = "Golden Buzzer";
 const COIN_SYMBOL = "BUZZER";
 const BOUNTY_URL = "https://make.fun/bounty/makefun-coin-promo-01";
 const DEADLINE_ISO = "2026-11-17T06:00:00Z";
 const PUMP_API = "https://frontend-api-v3.pump.fun/coins";
+const BOT_DIR = process.env.MAKEFUN_BOT_DIR ?? "/bot";
+const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+const LAUNCH_PATH = join(BOT_DIR, "LAUNCH.json");
+const BASE58 = "[1-9A-HJ-NP-Za-km-z]";
+const MINT_RE = new RegExp(`^${BASE58}{32,44}$`);
+const SIG_RE = new RegExp(`^${BASE58}{64,88}$`);
 
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
-
-// The base58 alphabet: digits and letters without 0, O, I, or l.
-const BASE58_PATTERN = /^[1-9A-HJ-NP-Za-km-z]+$/;
+type LaunchRecord = { mint: string; create_signature: string };
 
 function die(message: string): never {
   console.error(`error: ${message}`);
   process.exit(1);
 }
 
-function isBase58(value: unknown, minLength: number, maxLength: number): boolean {
-  return (
-    typeof value === "string" &&
-    value.length >= minLength &&
-    value.length <= maxLength &&
-    BASE58_PATTERN.test(value)
-  );
+function parseArgs(argv: string[]): { json: boolean; noLive: boolean } {
+  return { json: argv.includes("--json"), noLive: argv.includes("--no-live") };
 }
 
-function formatRemaining(nowMs: number): string {
-  const remainingMs = new Date(DEADLINE_ISO).getTime() - nowMs;
-  if (remainingMs <= 0) {
-    return "deadline passed";
+function loadLaunch(path: string): LaunchRecord {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    die(`cannot read launch record at ${path} (file unreadable or missing)`);
   }
-  const totalMinutes = Math.floor(remainingMs / 60_000);
-  const days = Math.floor(totalMinutes / (24 * 60));
-  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
-  const minutes = totalMinutes % 60;
-  const parts: string[] = [];
-  if (days > 0) parts.push(`${days}d`);
-  if (hours > 0) parts.push(`${hours}h`);
-  parts.push(`${minutes}m`);
-  return `${parts.join(" ")} left`;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw!);
+  } catch {
+    die(`launch record at ${path} is not valid JSON`);
+  }
+  const rec = parsed as Partial<LaunchRecord>;
+  if (typeof rec.mint !== "string" || !MINT_RE.test(rec.mint)) {
+    die(`launch record mint is invalid: expected base58 string of 32-44 chars, got ${JSON.stringify(rec.mint)}`);
+  }
+  if (typeof rec.create_signature !== "string" || !SIG_RE.test(rec.create_signature)) {
+    die(`launch record create_signature is invalid: expected base58 string of 64-88 chars, got ${JSON.stringify(rec.create_signature)}`);
+  }
+  return { mint: rec.mint, create_signature: rec.create_signature };
 }
 
-// ---------------------------------------------------------------------------
-// Promo drafts
-// ---------------------------------------------------------------------------
+function mirrorLaunch(src: string, outDir: string): string {
+  mkdirSync(outDir, { recursive: true });
+  const dest = join(outDir, "LAUNCH.json");
+  copyFileSync(src, dest);
+  return dest;
+}
 
-function promoPosts(): string[] {
+function countdownText(now: Date, deadlineIso: string): string {
+  const target = new Date(deadlineIso).getTime();
+  const diffMs = target - now.getTime();
+  if (Number.isNaN(target)) return "unknown deadline";
+  if (diffMs <= 0) return "deadline passed";
+  const totalSec = Math.floor(diffMs / 1000);
+  const d = Math.floor(totalSec / 86400);
+  const h = Math.floor((totalSec % 86400) / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  const parts: string[] = [];
+  if (d > 0) parts.push(`${d}d`);
+  if (h > 0 || d > 0) parts.push(`${h}h`);
+  if (m > 0 || h > 0 || d > 0) parts.push(`${m}m`);
+  parts.push(`${s}s`);
+  return `${parts.join(" ")} remaining`;
+}
+
+function pumpUrl(mint: string): string {
+  return `https://pump.fun/coin/${mint}`;
+}
+
+type DraftGroup = { voice: string; drafts: string[] };
+
+function buildPromoDrafts(): DraftGroup[] {
+  const b = BOUNTY_URL;
   return [
-    `The room stood up before the scores even landed. $BUZZER is the golden buzzer moment on make.fun — straight to the final, no queue. ${BOUNTY_URL}`,
-    `Most entries grind the make.fun leaderboard one match at a time. Once in a while, somebody slams the buzzer. That sound is $BUZZER. ${BOUNTY_URL}`,
-    `Gold confetti. A standing room. One slammed buzzer. $BUZZER is that make.fun moment, minted — hold it if your agent is one build away. ${BOUNTY_URL}`,
-    `No queue, no scorecard, no debate. When an entry on make.fun is that good, the buzzer decides. $BUZZER — straight to the final. ${BOUNTY_URL}`,
-    `The stage is open, the prizes sit in escrow, and the buzzer is waiting. $BUZZER is live for the make.fun crowd that ships in the open. ${BOUNTY_URL}`,
+    {
+      voice: "hype",
+      drafts: [
+        `THE GOLDEN BUZZER JUST GOT SLAMMED. $BUZZER is live, confetti in the air, judges on their feet. No queue, no waiting room — straight to the live shows. Enter on make.fun: ${b}`,
+        `BUZZ BUZZ. $BUZZER skipped the whole audition line and went golden on make.fun. One press, full stage lights, escrow prizes waiting for the loudest crowd. Join in: ${b}`,
+        `THIS IS THE MOMENT. Hand down, buzzer gold, confetti cannons fired for $BUZZER on make.fun. The stage is open and the prize pool sits in escrow. Be early: ${b}`,
+      ],
+    },
+    {
+      voice: "storyteller",
+      drafts: [
+        `Every act dreams of the night the room goes quiet, a hand hits gold, and confetti rewrites their story. That night is $BUZZER on make.fun — escrow prizes, real stage. Watch it unfold: ${b}`,
+        `She waited in the audition queue for hours. Then someone pressed the golden buzzer and the queue stopped mattering. $BUZZER is that press, live on make.fun. Step onto the stage: ${b}`,
+        `The best stage stories are not about winning the final — they are about the second everything changed. $BUZZER is that second, minted on make.fun with prizes held in escrow. Read the act: ${b}`,
+      ],
+    },
+    {
+      voice: "degen",
+      drafts: [
+        `ape the buzzer before the confetti settles. $BUZZER live on make.fun, escrow prizes locked, queue = skipped, stage = ours. send it: ${b}`,
+        `no audition, no judges smalltalk, just palm -> gold -> $BUZZER. make.fun bounty is live and the escrow bag does not blink. in early or watch the replay: ${b}`,
+        `pressed it. full send. $BUZZER golden buzzer arc on make.fun — confetti on the chart, prizes in escrow, latecomers in the queue we skipped. join: ${b}`,
+      ],
+    },
   ];
 }
 
-// ---------------------------------------------------------------------------
-// Launch record loading and validation
-// ---------------------------------------------------------------------------
-
-type LaunchRecord = {
-  mint?: unknown;
-  create_signature?: unknown;
-};
-
-function loadLaunchRecord(botDir: string): { mint: string; createSignature: string } {
-  const launchPath = join(botDir, "LAUNCH.json");
-  let raw: string;
-  try {
-    raw = readFileSync(launchPath, "utf8");
-  } catch {
-    die(`cannot read LAUNCH.json at ${launchPath}`);
+function renderPromoFile(groups: DraftGroup[]): string {
+  const lines: string[] = [];
+  lines.push(`# Golden Buzzer ($BUZZER) — promo drafts`);
+  lines.push(`# Bounty: ${BOUNTY_URL}`);
+  lines.push("");
+  for (const group of groups) {
+    lines.push(`## Voice: ${group.voice}`);
+    lines.push("");
+    group.drafts.forEach((draft, i) => {
+      lines.push(`${i + 1}. ${draft}`);
+      lines.push("");
+    });
   }
-  let parsed: LaunchRecord;
-  try {
-    parsed = JSON.parse(raw) as LaunchRecord;
-  } catch {
-    die("LAUNCH.json is not valid JSON");
-  }
-  if (!isBase58(parsed.mint, 32, 44)) {
-    die("LAUNCH.json field 'mint' must be a base58 string of 32-44 characters");
-  }
-  if (!isBase58(parsed.create_signature, 64, 88)) {
-    die("LAUNCH.json field 'create_signature' must be a base58 string of 64-88 characters");
-  }
-  return {
-    mint: parsed.mint as string,
-    createSignature: parsed.create_signature as string,
-  };
+  return lines.join("\n");
 }
 
-// ---------------------------------------------------------------------------
-// Best-effort live lookup (never fails the run)
-// ---------------------------------------------------------------------------
+function writePromoDrafts(outDir: string): string {
+  const dest = join(outDir, "promo-posts.txt");
+  writeFileSync(dest, renderPromoFile(buildPromoDrafts()), "utf8");
+  return dest;
+}
 
-async function printLiveLookup(mint: string): Promise<void> {
+function printStageCard(rec: LaunchRecord, mirroredTo: string): void {
+  const banner = [
+    "        \\  |  /",
+    "      --  \\ | /  --",
+    "           ___",
+    "        .-'   '-.",
+    "       /  GOLDEN  \\",
+    "      |   BUZZER   |",
+    "       \\  * * *   /",
+    "        '-.___.-'",
+    "     [  PRESS  IT  ]",
+  ];
+  for (const line of banner) console.log(line);
+  console.log("");
+  console.log(`Coin:     ${COIN_NAME} ($${COIN_SYMBOL})`);
+  console.log(`Mint:     ${rec.mint}`);
+  console.log(`Create tx: ${rec.create_signature}`);
+  console.log(`Pump.fun: ${pumpUrl(rec.mint)}`);
+  console.log(`Bounty:   ${BOUNTY_URL}`);
+  console.log(`Deadline: ${DEADLINE_ISO} (${countdownText(new Date(), DEADLINE_ISO)})`);
+  console.log(`Mirrored: ${mirroredTo}`);
+}
+
+async function liveLookup(mint: string): Promise<void> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5_000);
+  const timer = setTimeout(() => controller.abort(), 5000);
   try {
-    const response = await fetch(`${PUMP_API}/${mint}`, { signal: controller.signal });
-    if (!response.ok) {
-      throw new Error(`unexpected status ${response.status}`);
-    }
-    const data: any = await response.json();
-    const liveName = typeof data?.name === "string" ? data.name : COIN_NAME;
-    const liveSymbol = typeof data?.symbol === "string" ? data.symbol : COIN_SYMBOL;
-    const marketCap = typeof data?.usd_market_cap === "number" ? data.usd_market_cap : data?.market_cap;
-    console.log(`Live coin:    ${liveName} ($${liveSymbol})`);
-    if (typeof marketCap === "number") {
-      console.log(`Market cap:   $${marketCap.toLocaleString("en-US", { maximumFractionDigits: 2 })}`);
-    }
+    const res = await fetch(`${PUMP_API}/${mint}`, {
+      signal: controller.signal,
+      headers: { accept: "application/json" },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = (await res.json()) as Record<string, unknown>;
+    const name = typeof data.name === "string" ? data.name : COIN_NAME;
+    const symbol = typeof data.symbol === "string" ? data.symbol : COIN_SYMBOL;
+    console.log(`Live:     ${name} ($${symbol})`);
+    const mc =
+      typeof data.usd_market_cap === "number" ? data.usd_market_cap
+      : typeof data.market_cap === "number" ? data.market_cap
+      : null;
+    if (mc !== null) console.log(`Live MC:  $${mc.toLocaleString("en-US")}`);
+    else console.log("Live MC:  unavailable (not reported by API)");
   } catch {
-    console.log("Live check:   unavailable (continuing without it)");
+    console.log("Live:     unavailable (lookup failed, continuing offline)");
   } finally {
     clearTimeout(timer);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
 async function main(): Promise<void> {
-  const botDir = process.env.MAKEFUN_BOT_DIR ?? "/bot";
-  const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
-
-  const { mint, createSignature } = loadLaunchRecord(botDir);
-
-  // Mirror the launch record byte-for-byte and write the promo drafts.
-  mkdirSync(outputDir, { recursive: true });
-  copyFileSync(join(botDir, "LAUNCH.json"), join(outputDir, "LAUNCH.json"));
-  const postsText = promoPosts().join("\n\n") + "\n";
-  writeFileSync(join(outputDir, "promo-posts.txt"), postsText, "utf8");
-
-  // Status card.
-  console.log("----------------------------------------");
-  console.log(`${COIN_NAME} ($${COIN_SYMBOL})`);
-  console.log(`Mint:         ${mint}`);
-  console.log(`Create tx:    ${createSignature}`);
-  console.log(`Coin page:    https://pump.fun/coin/${mint}`);
-  console.log(`Bounty:       ${BOUNTY_URL}`);
-  console.log(`Deadline:     ${DEADLINE_ISO} (${formatRemaining(Date.now())})`);
-  console.log("----------------------------------------");
-
-  await printLiveLookup(mint);
-
-  console.log(`Launch record verified and mirrored to ${outputDir}`);
+  const args = parseArgs(process.argv.slice(2));
+  const rec = loadLaunch(LAUNCH_PATH);
+  const mirroredTo = mirrorLaunch(LAUNCH_PATH, OUTPUT_DIR);
+  const promoPath = writePromoDrafts(OUTPUT_DIR);
+  if (args.json) {
+    const summary = {
+      name: COIN_NAME,
+      symbol: COIN_SYMBOL,
+      mint: rec.mint,
+      create_signature: rec.create_signature,
+      pump_url: pumpUrl(rec.mint),
+      bounty_url: BOUNTY_URL,
+      deadline_iso: DEADLINE_ISO,
+      mirrored_to: mirroredTo,
+    };
+    console.log(JSON.stringify(summary));
+  } else {
+    printStageCard(rec, mirroredTo);
+    console.log(`Promo:    ${promoPath} (9 drafts: hype / storyteller / degen)`);
+    if (!args.noLive) await liveLookup(rec.mint);
+  }
+  console.log(`Golden Buzzer record verified and mirrored to ${mirroredTo}.`);
 }
 
 main().catch((err: unknown) => {
